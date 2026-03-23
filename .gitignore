@@ -1,0 +1,10 @@
+# 私钥与本地配置（绝不能上传到 GitHub 等）
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
