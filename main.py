@@ -119,21 +119,20 @@ def make_callback(tracker: PositionTracker):
 
         # ── 跟单买入（同一笔领袖 tx 只跟一次，防止 WS+区块 重复触发） ──
         if rc.effective_execute_copy() and action == "buy":
-            # 已有未平仓持仓时不跟买（单仓位策略：先卖完再开新仓）
-            open_positions = tracker.get_open_positions()
-            if open_positions:
-                logger.info(
-                    "[跳过跟买] 当前有 %d 笔未平仓持仓（例 %s…），暂不跟单买入",
-                    len(open_positions),
-                    (open_positions[0].token_address or "")[:10],
-                )
-                rc.record_event(
-                    "跳过跟买",
-                    "已有未平仓，不新开仓",
-                    count=len(open_positions),
-                    example=(open_positions[0].token_address or "")[:14],
-                )
-                return
+            # 仅当「这笔要跟的代币」已有未平仓时跳过；其它代币持仓不影响
+            if len(path) >= 2:
+                target_token = path[-1]
+                if tracker.has_position(target_token):
+                    logger.info(
+                        "[跳过跟买] 代币 %s… 已有未平仓，不重复开仓",
+                        target_token[:10],
+                    )
+                    rc.record_event(
+                        "跳过跟买",
+                        "该代币已有未平仓",
+                        token=(target_token or "")[:14],
+                    )
+                    return
             with _seen_lock:
                 if tx_hash_hex in executed_buy_hashes:
                     logger.debug("[去重] 领袖 tx %s 已跟单，跳过", tx_hash_hex[:16])
