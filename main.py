@@ -17,6 +17,7 @@ from threading import Thread
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
+import config
 from config import (
     COPY_AMOUNT_RATIO,
     COPY_SELL_ACTIONS,
@@ -29,6 +30,7 @@ from config import (
     TAKE_PROFIT_PCT,
     validate_config,
 )
+import runtime_controls as rc
 from decoder import get_trade_action, get_trade_type_and_summary, parse_leader_tx
 from executor import execute_copy_tx
 from monitor import monitor_pending_transactions
@@ -101,7 +103,12 @@ def make_callback(tracker: PositionTracker):
         path = swap_info.get("path") or []
 
         # ── 领袖卖出 → 触发跟卖 ──
-        if action == "sell" and len(path) >= 2:
+        if (
+            action == "sell"
+            and len(path) >= 2
+            and rc.effective_execute_copy()
+            and rc.effective_copy_sell()
+        ):
             sold_token = path[0]
             if tracker.has_position(sold_token):
                 logger.info("[跟卖触发] 领袖卖出 %s，我们也持有，执行卖出", sold_token[:10])
@@ -111,7 +118,22 @@ def make_callback(tracker: PositionTracker):
                 return
 
         # ── 跟单买入（同一笔领袖 tx 只跟一次，防止 WS+区块 重复触发） ──
-        if EXECUTE_COPY and action == "buy":
+        if rc.effective_execute_copy() and action == "buy":
+            # 已有未平仓持仓时不跟买（单仓位策略：先卖完再开新仓）
+            open_positions = tracker.get_open_positions()
+            if open_positions:
+                logger.info(
+                    "[跳过跟买] 当前有 %d 笔未平仓持仓（例 %s…），暂不跟单买入",
+                    len(open_positions),
+                    (open_positions[0].token_address or "")[:10],
+                )
+                rc.record_event(
+                    "跳过跟买",
+                    "已有未平仓，不新开仓",
+                    count=len(open_positions),
+                    example=(open_positions[0].token_address or "")[:14],
+                )
+                return
             with _seen_lock:
                 if tx_hash_hex in executed_buy_hashes:
                     logger.debug("[去重] 领袖 tx %s 已跟单，跳过", tx_hash_hex[:16])
@@ -139,12 +161,21 @@ def make_callback(tracker: PositionTracker):
                     "[跟单买入成功] tx=%s 代币=%s 成本=%.6f BNB (比例=%.4f)",
                     copy_hash, bought_token[:10], cost_bnb / 1e18, COPY_AMOUNT_RATIO,
                 )
+                rc.record_event(
+                    "跟买",
+                    "跟单买入已发送",
+                    tx=copy_hash,
+                    token=bought_token[:14],
+                    cost_bnb=round(cost_bnb / 1e18, 8),
+                )
             elif copy_hash:
                 logger.info("[跟单成功] tx=%s (比例=%.4f)", copy_hash, COPY_AMOUNT_RATIO)
+                rc.record_event("跟买", "跟单已发送(未记仓)", tx=copy_hash)
             else:
                 logger.warning("[跟单发送失败]")
+                rc.record_event("跟买失败", "发送失败或未返回交易", leader_tx=tx_hash_hex[:18])
 
-        elif action == "sell" and EXECUTE_COPY:
+        elif action == "sell" and rc.effective_execute_copy():
             logger.debug("领袖卖出但我们无持仓，跳过")
 
     return on_leader_tx
@@ -239,12 +270,35 @@ async def run():
         take_profit_pct=TAKE_PROFIT_PCT,
         check_interval=TAKE_PROFIT_CHECK_INTERVAL,
     )
+    tracker.load_persistent_positions()
+    tracker.reconcile_on_startup()
     callback = make_callback(tracker)
 
     logger.info(
         "BSC 监控启动 | 领袖: %s | 执行跟单=%s | 跟卖=%s | 止盈=%.0f%% | 检查间隔=%.0fs",
         list(leaders), EXECUTE_COPY, COPY_SELL_ACTIONS, TAKE_PROFIT_PCT, TAKE_PROFIT_CHECK_INTERVAL,
     )
+
+    if config.DASHBOARD_ENABLE:
+        dash_err = config.dashboard_config_error()
+        if dash_err:
+            logger.error("网页控制台未启动：%s。", dash_err)
+        else:
+            if config.dashboard_bind_is_all_interfaces():
+                logger.warning(
+                    "控制台监听 %s（全网卡）：务必在云安全组只放行你自己的 IP，并保管好 DASHBOARD_TOKEN。",
+                    config.DASHBOARD_HOST,
+                )
+            from web_dashboard import start_dashboard_background
+
+            start_dashboard_background(tracker)
+            port = config.DASHBOARD_PORT
+            host = config.DASHBOARD_HOST
+            logger.info(
+                "网页控制台 http://%s:%s — 口令见 DASHBOARD_TOKEN（仅监听本机时请自行做 SSH 端口转发）",
+                host,
+                port,
+            )
 
     # 子线程 1：区块轮询（带自动节点轮换）
     t1 = Thread(target=_block_poll_thread, args=(leaders, callback, tracker, 1.0), daemon=True)

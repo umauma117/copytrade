@@ -63,6 +63,38 @@ try:
 except ValueError:
     TAKE_PROFIT_CHECK_INTERVAL = 10.0
 
+# 未平仓仓位本地快照（相对运行目录，重启后恢复并做链上自检）
+POSITIONS_STATE_FILE = (os.getenv("POSITIONS_STATE_FILE", ".positions_state.json") or "").strip() or ".positions_state.json"
+
+# 网页控制台（Flask）
+DASHBOARD_ENABLE = os.getenv("DASHBOARD_ENABLE", "false").strip().lower() in ("true", "1", "yes")
+DASHBOARD_HOST = (os.getenv("DASHBOARD_HOST", "127.0.0.1") or "").strip() or "127.0.0.1"
+try:
+    DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8765").strip() or "8765")
+except ValueError:
+    DASHBOARD_PORT = 8765
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+
+# 控制台口令最短长度（过短易被猜中）
+DASHBOARD_TOKEN_MIN_LEN = 16
+
+
+def dashboard_bind_is_all_interfaces() -> bool:
+    """是否监听所有网卡（外网可达风险高）。"""
+    h = DASHBOARD_HOST.strip().lower()
+    return h in ("0.0.0.0", "::", "[::]")
+
+
+def dashboard_config_error() -> str:
+    """开启控制台时若配置不合格，返回中文错误说明，否则返回空串。"""
+    if not DASHBOARD_ENABLE:
+        return ""
+    if not DASHBOARD_TOKEN:
+        return "未设置 DASHBOARD_TOKEN（.env 里加一行，至少 16 位乱码）"
+    if len(DASHBOARD_TOKEN) < DASHBOARD_TOKEN_MIN_LEN:
+        return f"DASHBOARD_TOKEN 太短，至少 {DASHBOARD_TOKEN_MIN_LEN} 个字符"
+    return ""
+
 
 def validate_config():
     if not LEADER_ADDRESSES:

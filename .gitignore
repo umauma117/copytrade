@@ -11,3 +11,6 @@ venv/
 
 # macOS
 .DS_Store
+
+# 运行时仓位快照（含路由信息，勿提交）
+.positions_state.json

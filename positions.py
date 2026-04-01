@@ -6,7 +6,9 @@
   - 盈利 ≥ TAKE_PROFIT_PCT 时自动卖出
   - 领袖卖出时也自动卖出（由 main.py 调用 trigger_leader_sell）
 """
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -16,7 +18,8 @@ from eth_account import Account
 from web3 import Web3
 
 from abi import UNISWAP_V2_ROUTER_ABI
-from config import FOLLOWER_PRIVATE_KEY, SLIPPAGE_BPS
+from config import FOLLOWER_PRIVATE_KEY, POSITIONS_STATE_FILE, SLIPPAGE_BPS
+from runtime_controls import effective_execute_copy, record_event
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +80,152 @@ class PositionTracker:
         """获取当前 w3 实例。"""
         with self._w3_lock:
             return self.w3
+
+    def _state_file_path(self) -> str:
+        return os.path.abspath(POSITIONS_STATE_FILE)
+
+    @staticmethod
+    def _position_to_dict(p: Position) -> dict:
+        return {
+            "token_address": p.token_address,
+            "amount": p.amount,
+            "cost_bnb": p.cost_bnb,
+            "router_address": p.router_address,
+            "buy_path": list(p.buy_path),
+            "buy_tx_hash": p.buy_tx_hash or "",
+            "sold": p.sold,
+            "sell_tx_hash": p.sell_tx_hash or "",
+            "aggregator_addr": p.aggregator_addr or "",
+            "aggregator_sell_payload": (
+                "0x" + p.aggregator_sell_payload.hex() if p.aggregator_sell_payload else ""
+            ),
+            "extra_approve_spenders": list(p.extra_approve_spenders or []),
+        }
+
+    def _position_from_dict(self, d: dict) -> Optional[Position]:
+        try:
+            w3 = self.get_w3()
+            ta = d.get("token_address")
+            ra = d.get("router_address")
+            if not ta or not ra:
+                return None
+            paths = d.get("buy_path") or []
+            if not paths:
+                return None
+            pl = (d.get("aggregator_sell_payload") or "").strip()
+            if pl.startswith("0x"):
+                pl = pl[2:]
+            payload = bytes.fromhex(pl) if pl else b""
+            extras = d.get("extra_approve_spenders") or []
+            return Position(
+                token_address=w3.to_checksum_address(ta),
+                amount=int(d.get("amount") or 0),
+                cost_bnb=int(d.get("cost_bnb") or 0),
+                router_address=w3.to_checksum_address(ra),
+                buy_path=[w3.to_checksum_address(x) for x in paths],
+                buy_tx_hash=str(d.get("buy_tx_hash") or ""),
+                sold=bool(d.get("sold")),
+                sell_tx_hash=str(d.get("sell_tx_hash") or ""),
+                aggregator_addr=w3.to_checksum_address(d["aggregator_addr"])
+                if d.get("aggregator_addr")
+                else "",
+                aggregator_sell_payload=payload,
+                extra_approve_spenders=[str(x).lower() for x in extras if x],
+            )
+        except Exception as e:
+            logger.warning("[仓位恢复] 单条解析失败: %s", e)
+            return None
+
+    def persist_open_positions(self):
+        """将当前未平仓仓位写入本地文件（供重启恢复）。"""
+        path = self._state_file_path()
+        try:
+            with self._lock:
+                open_list = [p for p in self._positions.values() if not p.sold]
+                payload = {"version": 1, "positions": [self._position_to_dict(p) for p in open_list]}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning("[仓位持久化] 写入失败 %s: %s", path, e)
+
+    def load_persistent_positions(self):
+        """启动时从本地文件恢复未平仓仓位。"""
+        path = self._state_file_path()
+        if not os.path.isfile(path):
+            logger.info("[启动自检] 无仓位快照文件 %s，按空仓启动", path)
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data.get("positions") if isinstance(data, dict) else None
+            if not rows:
+                logger.info("[启动自检] 快照为空 %s", path)
+                return
+            loaded = 0
+            with self._lock:
+                for d in rows:
+                    if not isinstance(d, dict) or d.get("sold"):
+                        continue
+                    pos = self._position_from_dict(d)
+                    if not pos or pos.sold:
+                        continue
+                    self._positions[pos.token_address.lower()] = pos
+                    loaded += 1
+            logger.info("[启动自检] 已从 %s 恢复 %d 笔未平仓记录", path, loaded)
+        except Exception as e:
+            logger.warning("[启动自检] 读取快照失败 %s: %s", path, e)
+
+    def reconcile_on_startup(self):
+        """
+        启动自检：对恢复后的每笔仓位查链上 balanceOf。
+        - 余额为 0：视为已平仓，从内存移除并更新快照
+        - 余额 > 0：把 amount 同步为链上余额
+        """
+        if not FOLLOWER_PRIVATE_KEY:
+            logger.info("[启动自检] 未配置 FOLLOWER_PRIVATE_KEY，跳过链上余额核对")
+            self.persist_open_positions()
+            return
+        with self._lock:
+            keys = [k for k, p in self._positions.items() if not p.sold]
+        if not keys:
+            logger.info("[启动自检] 当前无未平仓记录，跳过链上核对")
+            self.persist_open_positions()
+            return
+        zeroed = 0
+        synced = 0
+        for k in keys:
+            with self._lock:
+                pos = self._positions.get(k)
+                if not pos or pos.sold:
+                    continue
+                token_addr = pos.token_address
+            bal = self._get_token_balance(token_addr)
+            if bal <= 0:
+                with self._lock:
+                    if k in self._positions:
+                        del self._positions[k]
+                zeroed += 1
+                logger.info(
+                    "[启动自检] %s 链上余额为 0，已从本地仓位移除（可能已卖出手动处理）",
+                    k[:10],
+                )
+            else:
+                with self._lock:
+                    p = self._positions.get(k)
+                    if p and not p.sold and p.amount != bal:
+                        old = p.amount
+                        p.amount = bal
+                        logger.info("[启动自检] %s 同步链上余额 %d -> %d", k[:10], old, bal)
+                        synced += 1
+        logger.info(
+            "[启动自检] 链上核对完成：检查 %d 笔，移除空仓 %d 笔，余额校正 %d 笔",
+            len(keys),
+            zeroed,
+            synced,
+        )
+        self.persist_open_positions()
 
     # ── 记录买入 ──────────────────────────────────────────────
 
@@ -143,6 +292,8 @@ class PositionTracker:
 
             threading.Thread(target=_post_buy_setup, daemon=True).start()
 
+        self.persist_open_positions()
+
     # ── 领袖卖出触发 ─────────────────────────────────────────
 
     def trigger_leader_sell(
@@ -174,12 +325,17 @@ class PositionTracker:
                             have.add(sl)
                             pos.extra_approve_spenders.append(sl)
         logger.info("[卖出触发] 领袖卖出 %s，执行跟卖", key[:10])
-        return self._execute_sell(pos, reason="领袖卖出")
+        h = self._execute_sell(pos, reason="领袖卖出")
+        if h:
+            record_event("跟卖", "领袖跟卖已发送", tx=h, token=key[:14])
+        return h
 
     # ── 止盈检查（后台线程调用）───────────────────────────────
 
     def check_take_profit(self):
         """遍历持仓，检查是否达到止盈线。"""
+        if not effective_execute_copy():
+            return
         with self._lock:
             open_positions = [
                 (k, p) for k, p in self._positions.items() if not p.sold
@@ -203,7 +359,15 @@ class PositionTracker:
                         "[止盈触发] %s 盈利 %.1f%% >= %.1f%%，执行卖出",
                         key[:10], pnl_pct, self.take_profit_pct,
                     )
-                    self._execute_sell(pos, reason=f"止盈 {pnl_pct:.1f}%")
+                    h = self._execute_sell(pos, reason=f"止盈 {pnl_pct:.1f}%")
+                    if h:
+                        record_event(
+                            "止盈",
+                            f"止盈卖出 ≥{self.take_profit_pct:.0f}%",
+                            tx=h,
+                            token=key[:14],
+                            pnl_pct=round(pnl_pct, 2),
+                        )
             except Exception as e:
                 logger.debug("[止盈检查] %s 异常: %s", key[:10], e)
 
@@ -405,64 +569,74 @@ class PositionTracker:
 
         account = Account.from_key(FOLLOWER_PRIVATE_KEY)
 
-        for attempt in range(1, self._MAX_SELL_RETRIES + 1):
-            balance = self._get_token_balance(pos.token_address)
-            if balance <= 0:
-                logger.info("[卖出] %s 余额为 0，认为已卖出", pos.token_address[:10])
-                with self._lock:
-                    pos.sold = True
-                return pos.sell_tx_hash or None
+        try:
+            for attempt in range(1, self._MAX_SELL_RETRIES + 1):
+                balance = self._get_token_balance(pos.token_address)
+                if balance <= 0:
+                    logger.info("[卖出] %s 余额为 0，认为已卖出", pos.token_address[:10])
+                    with self._lock:
+                        pos.sold = True
+                        k = pos.token_address.lower()
+                        if k in self._positions:
+                            del self._positions[k]
+                    return pos.sell_tx_hash or None
 
-            if attempt > 1:
-                logger.info("[卖出重试] %s 第 %d 次尝试，余额=%d", pos.token_address[:10], attempt, balance)
+                if attempt > 1:
+                    logger.info("[卖出重试] %s 第 %d 次尝试，余额=%d", pos.token_address[:10], attempt, balance)
 
-            # ── 聚合器卖出路径 ──
-            if pos.aggregator_addr and pos.aggregator_sell_payload:
-                hash_hex = self._execute_sell_via_aggregator(pos, account, balance, reason)
-            else:
-                hash_hex = self._execute_sell_v2(pos, account, balance, reason)
-
-            if not hash_hex:
-                # 发送失败（非上链失败），稍等后重试
-                if attempt < self._MAX_SELL_RETRIES:
-                    time.sleep(3)
-                continue
-
-            # ── 等待链上确认 ──
-            try:
-                receipt = self.w3.eth.wait_for_transaction_receipt(hash_hex, timeout=60)
-                if receipt.get("status") == 1:
-                    # 成功：再确认余额归零
-                    remaining = self._get_token_balance(pos.token_address)
-                    if remaining > 0:
-                        logger.warning(
-                            "[卖出核查] %s 仍有余额 %d，可能税费扣除不足或部分成交，重试",
-                            pos.token_address[:10], remaining,
-                        )
-                        with self._lock:
-                            pos.sold = False  # 允许重试
-                        time.sleep(2)
-                        continue
-                    logger.info("[卖出确认] %s 余额归零，卖出完成", pos.token_address[:10])
-                    return hash_hex
+                # ── 聚合器卖出路径 ──
+                if pos.aggregator_addr and pos.aggregator_sell_payload:
+                    hash_hex = self._execute_sell_via_aggregator(pos, account, balance, reason)
                 else:
-                    logger.warning(
-                        "[卖出链上失败] %s tx=%s status=0，重试",
-                        pos.token_address[:10], hash_hex,
-                    )
-                    # 打印一次可读的 revert reason（尽量）
-                    self._debug_revert(account, hash_hex, pos)
+                    hash_hex = self._execute_sell_v2(pos, account, balance, reason)
+
+                if not hash_hex:
+                    # 发送失败（非上链失败），稍等后重试
+                    if attempt < self._MAX_SELL_RETRIES:
+                        time.sleep(3)
+                    continue
+
+                # ── 等待链上确认 ──
+                try:
+                    receipt = self.w3.eth.wait_for_transaction_receipt(hash_hex, timeout=60)
+                    if receipt.get("status") == 1:
+                        # 成功：再确认余额归零
+                        remaining = self._get_token_balance(pos.token_address)
+                        if remaining > 0:
+                            logger.warning(
+                                "[卖出核查] %s 仍有余额 %d，可能税费扣除不足或部分成交，重试",
+                                pos.token_address[:10], remaining,
+                            )
+                            with self._lock:
+                                pos.sold = False  # 允许重试
+                            time.sleep(2)
+                            continue
+                        logger.info("[卖出确认] %s 余额归零，卖出完成", pos.token_address[:10])
+                        with self._lock:
+                            k = pos.token_address.lower()
+                            if k in self._positions:
+                                del self._positions[k]
+                        return hash_hex
+                    else:
+                        logger.warning(
+                            "[卖出链上失败] %s tx=%s status=0，重试",
+                            pos.token_address[:10], hash_hex,
+                        )
+                        # 打印一次可读的 revert reason（尽量）
+                        self._debug_revert(account, hash_hex, pos)
+                        with self._lock:
+                            pos.sold = False
+                        time.sleep(2)
+                except Exception as e:
+                    logger.warning("[卖出] 等待 receipt 超时或异常: %s，继续重试", e)
                     with self._lock:
                         pos.sold = False
-                    time.sleep(2)
-            except Exception as e:
-                logger.warning("[卖出] 等待 receipt 超时或异常: %s，继续重试", e)
-                with self._lock:
-                    pos.sold = False
-                time.sleep(3)
+                    time.sleep(3)
 
-        logger.error("[卖出失败] %s 重试 %d 次后仍失败", pos.token_address[:10], self._MAX_SELL_RETRIES)
-        return None
+            logger.error("[卖出失败] %s 重试 %d 次后仍失败", pos.token_address[:10], self._MAX_SELL_RETRIES)
+            return None
+        finally:
+            self.persist_open_positions()
 
     def _execute_sell_v2(self, pos: Position, account, balance: int, reason: str) -> Optional[str]:
         """标准 PancakeSwap V2 卖出（不等链上确认，由 _execute_sell 统一处理）。"""
