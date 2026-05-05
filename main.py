@@ -127,12 +127,19 @@ def make_callback(tracker: PositionTracker):
                 return
             to_addr = tx.get("to") or "合约创建"
             value_bnb = int(tx.get("value") or 0) / 1e18
+            data = tx.get("input") or tx.get("data") or ""
+            selector = ""
+            try:
+                selector = (str(data)[:10] if data else "").lower()
+            except Exception:
+                selector = ""
             logger.info(
-                "[非swap%s] from=%s to=%s value=%.6f BNB tx=%s...%s",
+                "[非swap%s] from=%s to=%s value=%.6f BNB selector=%s tx=%s...%s",
                 f"/{source}" if source else "",
                 (tx.get("from") or "")[:10],
                 (to_addr or "")[:10],
                 value_bnb,
+                selector or "(none)",
                 tx_hash_hex[:12],
                 tx_hash_hex[-8:],
             )

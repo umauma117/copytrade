@@ -405,15 +405,16 @@ def _parse_from_receipt(
 
     if receipt is None:
         last_err = None
-        for _ in range(4):
+        for _ in range(6):
             try:
                 receipt = w3.eth.get_transaction_receipt(tx_hash)
                 break
             except Exception as e:
                 last_err = e
-                time.sleep(0.15)
+                time.sleep(0.25)
         if receipt is None:
-            logger.debug("获取收据失败 %s: %s", tx_hash[:12], last_err)
+            # confirmed tx 的收据拉不到时，后续永远无法靠 Transfer 兜底识别（至少打一条可见日志）
+            logger.info("获取收据失败 %s...: %s", tx_hash[:12], str(last_err)[:140])
             return None
     if not receipt:
         return None
