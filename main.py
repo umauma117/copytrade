@@ -13,6 +13,7 @@ import logging
 import sys
 import time
 from threading import Thread
+from typing import Optional
 
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -31,7 +32,12 @@ from config import (
     validate_config,
 )
 import runtime_controls as rc
-from decoder import get_trade_action, get_trade_type_and_summary, parse_leader_tx
+from decoder import (
+    QUOTE_TOKENS_BSC,
+    get_trade_action,
+    get_trade_type_and_summary,
+    parse_leader_tx,
+)
 from executor import execute_copy_tx
 from monitor import monitor_pending_transactions
 from positions import PositionTracker
@@ -59,6 +65,42 @@ def _normalize_hash(h) -> str:
     return s.lower()
 
 
+def _tx_looks_pending(tx: dict) -> bool:
+    """未入块时收据往往不存在，解析会失败，应等区块线程带 blockNumber 再处理。"""
+    bn = tx.get("blockNumber")
+    if bn is None:
+        return True
+    if isinstance(bn, str) and bn.lower() == "pending":
+        return True
+    return False
+
+
+def _token_leader_disposes(swap_info: dict) -> Optional[str]:
+    """
+    领袖这笔若在减持某个代币（换成 BNB/稳定币或其它币），返回 path 里被卖掉的 token。
+    buy 不会返回；「非主流→非主流」在 decoder 里是 action=swap，也必须跟卖 path[0]。
+    """
+    path = swap_info.get("path") or []
+    if len(path) < 2:
+        return None
+    action = get_trade_action(swap_info)
+    t0 = (path[0] or "").lower()
+    t1 = (path[-1] or "").lower()
+    quotes = QUOTE_TOKENS_BSC
+
+    if action == "sell":
+        return path[0]
+    if action != "swap":
+        return None
+    # 双稳定/双计价互换：不跟
+    if t0 in quotes and t1 in quotes:
+        return None
+    # 起点是非计价币：视为在卖掉 path[0]（含 alt→alt）
+    if t0 not in quotes:
+        return path[0]
+    return None
+
+
 def make_callback(tracker: PositionTracker):
     seen_hashes: set = set()
     executed_buy_hashes: set = set()  # 已为此领袖 tx 执行过跟单买入，防止重复下单
@@ -71,17 +113,18 @@ def make_callback(tracker: PositionTracker):
         tx_hash_hex = _normalize_hash(raw_hash)
         if not tx_hash_hex:
             return
-        # WS + 区块线程并发：先按领袖 tx hash 去重，同一笔只处理一次
-        with _seen_lock:
-            if tx_hash_hex in seen_hashes:
-                return
-            seen_hashes.add(tx_hash_hex)
-            if len(seen_hashes) > 10000:
-                seen_hashes.clear()
-                executed_buy_hashes.clear()
 
         swap_info = parse_leader_tx(tx, w3)
         if not swap_info:
+            # 勿在「解析失败」时立刻去重：pending 无收据会误判，入块后应再解析（否则跟卖/收据解码永久丢失）
+            if _tx_looks_pending(tx):
+                logger.debug(
+                    "[解析待收据%s] 无收据先跳过，入块后再解析 tx=%s...%s",
+                    f"/{source}" if source else "",
+                    tx_hash_hex[:12],
+                    tx_hash_hex[-8:],
+                )
+                return
             to_addr = tx.get("to") or "合约创建"
             value_bnb = int(tx.get("value") or 0) / 1e18
             logger.info(
@@ -93,7 +136,21 @@ def make_callback(tracker: PositionTracker):
                 tx_hash_hex[:12],
                 tx_hash_hex[-8:],
             )
+            with _seen_lock:
+                seen_hashes.add(tx_hash_hex)
+                if len(seen_hashes) > 10000:
+                    seen_hashes.clear()
+                    executed_buy_hashes.clear()
             return
+
+        # 已成功解析：再按 hash 去重（避免 WS 与区块各处理一次）
+        with _seen_lock:
+            if tx_hash_hex in seen_hashes:
+                return
+            seen_hashes.add(tx_hash_hex)
+            if len(seen_hashes) > 10000:
+                seen_hashes.clear()
+                executed_buy_hashes.clear()
 
         action = get_trade_action(swap_info)
         trade_type, summary = get_trade_type_and_summary(swap_info, tx_hash_hex)
@@ -102,20 +159,29 @@ def make_callback(tracker: PositionTracker):
 
         path = swap_info.get("path") or []
 
-        # ── 领袖卖出 → 触发跟卖 ──
-        if (
-            action == "sell"
-            and len(path) >= 2
-            and rc.effective_execute_copy()
-            and rc.effective_copy_sell()
-        ):
-            sold_token = path[0]
-            if tracker.has_position(sold_token):
-                logger.info("[跟卖触发] 领袖卖出 %s，我们也持有，执行卖出", sold_token[:10])
-                sell_hash = tracker.trigger_leader_sell(sold_token, sell_swap_info=swap_info)
+        # ── 领袖减持（含 sell 与 decoder 标成 swap 的 alt→alt）→ 跟卖 ──
+        disposed = _token_leader_disposes(swap_info)
+        if disposed is not None and rc.effective_execute_copy():
+            if not rc.effective_copy_sell():
+                logger.info(
+                    "[跟卖已关闭] 领袖减持 %s… 请开 COPY_SELL_ACTIONS 或控制台「领袖跟卖」",
+                    disposed[:10],
+                )
+                return
+            if tracker.has_position(disposed):
+                logger.info("[跟卖触发] 领袖卖出 %s，我们也持有，执行卖出", disposed[:10])
+                sell_hash = tracker.trigger_leader_sell(disposed, sell_swap_info=swap_info)
                 if sell_hash:
                     logger.info("[跟卖成功] tx=%s", sell_hash)
+                else:
+                    logger.warning("[跟卖失败] 已触发但未拿到交易哈希，请看上方 positions 日志")
                 return
+            logger.info(
+                "[跟卖跳过] 领袖减持 %s… 我们无该代币未平仓（类型=%s）",
+                disposed[:10],
+                trade_type,
+            )
+            return
 
         # ── 跟单买入（同一笔领袖 tx 只跟一次，防止 WS+区块 重复触发） ──
         if rc.effective_execute_copy() and action == "buy":
@@ -173,9 +239,6 @@ def make_callback(tracker: PositionTracker):
             else:
                 logger.warning("[跟单发送失败]")
                 rc.record_event("跟买失败", "发送失败或未返回交易", leader_tx=tx_hash_hex[:18])
-
-        elif action == "sell" and rc.effective_execute_copy():
-            logger.debug("领袖卖出但我们无持仓，跳过")
 
     return on_leader_tx
 

@@ -47,6 +47,9 @@ CUSTOM_EXEC_SELECTORS = {
 # 聚合器合约选择器（直接 calldata 解码，不依赖收据）
 AGGREGATOR_SELECTORS = {
     "0x0b3f5cf9",   # swap(tuple[] descs, address feeToken, uint256 amountIn, uint256 minReturn)
+    # 领袖近期观测到同一聚合路由的另一入口；很多场景 payload 结构与 0x0b3f5cf9 相同/相近
+    # 若解码失败，会自动回退到收据 Transfer 事件反推买卖。
+    "0x4d819a2a",
 }
 
 # 已知的聚合路由合约地址（只有发往这些地址的交易才走聚合器解码）
@@ -523,6 +526,24 @@ def _parse_from_receipt(
             "router": PANCAKE_V2_ROUTER.lower(),
             "_from_receipt": True,
         }
+
+    # 兜底调试信息：有收据但无法判定买卖，输出摘要方便补规则（debug 级别，避免刷屏）
+    try:
+        if logs:
+            def _top3(d: Dict[str, int]):
+                return sorted(d.items(), key=lambda x: x[1], reverse=True)[:3]
+            logger.debug(
+                "[收据解析-未判定] tx=%s logs=%d toEOA=%s toContract=%s fromEOA=%s fromContract=%s totals=%s",
+                tx_hash[:12],
+                len(logs),
+                [(k[:10], v) for k, v in _top3(tokens_to_leader)],
+                [(k[:10], v) for k, v in _top3(tokens_to_contract)],
+                [(k[:10], v) for k, v in _top3(tokens_from_leader)],
+                [(k[:10], v) for k, v in _top3(tokens_from_contract)],
+                [(k[:10], v) for k, v in _top3(non_quote_totals)],
+            )
+    except Exception:
+        pass
 
     return None
 
