@@ -64,6 +64,28 @@ def _normalize_hash(h) -> str:
         s = "0x" + s
     return s.lower()
 
+def _selector_0x(tx: dict) -> str:
+    """Extract 4-byte selector as 0x???????? for logging."""
+    data = tx.get("input") or tx.get("data") or b""
+    try:
+        # HexBytes/bytes
+        if isinstance(data, (bytes, bytearray)):
+            if len(data) >= 4:
+                return "0x" + bytes(data[:4]).hex()
+            return "(none)"
+        # already hex string
+        s = str(data)
+        if not s:
+            return "(none)"
+        if s.startswith("0x") and len(s) >= 10:
+            return s[:10].lower()
+        # fallback: try treat as hex without 0x
+        if len(s) >= 8:
+            return ("0x" + s[:8]).lower()
+    except Exception:
+        pass
+    return "(none)"
+
 
 def _tx_looks_pending(tx: dict) -> bool:
     """未入块时收据往往不存在，解析会失败，应等区块线程带 blockNumber 再处理。"""
@@ -127,21 +149,15 @@ def make_callback(tracker: PositionTracker):
                 return
             to_addr = tx.get("to") or "合约创建"
             value_bnb = int(tx.get("value") or 0) / 1e18
-            data = tx.get("input") or tx.get("data") or ""
-            selector = ""
-            try:
-                selector = (str(data)[:10] if data else "").lower()
-            except Exception:
-                selector = ""
+            selector = _selector_0x(tx)
             logger.info(
-                "[非swap%s] from=%s to=%s value=%.6f BNB selector=%s tx=%s...%s",
+                "[非swap%s] from=%s to=%s value=%.6f BNB selector=%s tx=%s",
                 f"/{source}" if source else "",
                 (tx.get("from") or "")[:10],
                 (to_addr or "")[:10],
                 value_bnb,
                 selector or "(none)",
-                tx_hash_hex[:12],
-                tx_hash_hex[-8:],
+                tx_hash_hex,
             )
             with _seen_lock:
                 seen_hashes.add(tx_hash_hex)
