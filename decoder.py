@@ -237,6 +237,7 @@ def _decode_aggregator_swap(raw: str, value_wei: int, w3: Web3, to_addr: str = "
 
 # ERC20 Transfer 事件 topic
 _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_TRANSFER_TOPIC_NO0X = _TRANSFER_TOPIC.lower().replace("0x", "")
 
 # PancakeSwap V2 Router（用于跟单执行）
 PANCAKE_V2_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -322,6 +323,9 @@ def parse_leader_tx(tx: dict, w3: Web3) -> Optional[Dict[str, Any]]:
     if not tx_hash:
         return _finish(_parse_custom_heuristic(w3, leader_addr, selector, to_addr, value))
     tx_hash_hex = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+    # HexBytes.hex() returns without 0x; web3 receipt APIs expect 0x-prefixed hash.
+    if tx_hash_hex and not str(tx_hash_hex).startswith("0x"):
+        tx_hash_hex = "0x" + str(tx_hash_hex)
     from_addr = (tx.get("from") or "").lower()
     out = _parse_from_receipt(w3, tx_hash_hex, from_addr, value, receipt=tx.get("_receipt"))
     if out:
@@ -441,8 +445,8 @@ def _parse_from_receipt(
         if not topics:
             continue
         t0 = topics[0]
-        t0_hex = t0.hex() if hasattr(t0, "hex") else str(t0)
-        if t0_hex.lower() != _TRANSFER_TOPIC.lower():
+        t0_hex = (t0.hex() if hasattr(t0, "hex") else str(t0)).lower().replace("0x", "")
+        if t0_hex != _TRANSFER_TOPIC_NO0X:
             continue
         if len(topics) < 3:
             continue
